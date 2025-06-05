@@ -10,6 +10,7 @@ class MarketImpactCalculator:
         self.epsilon = 0.0625  # Fixed cost coefficient
         self.orderbook_history = []
         self.price_history = []
+        self.trade_history = []  # For VWAP calculation
         
     def update_orderbook(self, orderbook_data: dict):
         """Update internal state with new orderbook data"""
@@ -18,11 +19,56 @@ class MarketImpactCalculator:
         if len(self.orderbook_history) > 100:
             self.orderbook_history.pop(0)
             
-        # Extract mid price
+        # Extract mid price and update price history
         best_bid = float(orderbook_data['bids'][0][0])
         best_ask = float(orderbook_data['asks'][0][0])
         mid_price = (best_bid + best_ask) / 2
-        self.price_history.append((datetime.fromisoformat(orderbook_data['timestamp']), mid_price))
+        timestamp = datetime.fromisoformat(orderbook_data['timestamp'])
+        
+        self.price_history.append((timestamp, mid_price))
+        
+        # Simulate some trades for VWAP calculation (in production we will use real trade data)
+        trade_size = np.random.lognormal(0, 1)
+        self.trade_history.append((timestamp, mid_price, trade_size))
+        
+        # Keep only last hour of trade history
+        cutoff_time = timestamp - timedelta(hours=1)
+        self.trade_history = [(t, p, s) for t, p, s in self.trade_history if t > cutoff_time]
+
+    def calculate_vwap(self) -> float:
+        """Calculate Volume Weighted Average Price from recent trades"""
+        if not self.trade_history:
+            return self.get_mid_price()
+            
+        total_volume = sum(size for _, _, size in self.trade_history)
+        if total_volume == 0:
+            return self.get_mid_price()
+            
+        vwap = sum(price * size for _, price, size in self.trade_history) / total_volume
+        return vwap
+        
+    def get_vwap_deviation(self) -> float:
+        """Calculate current price deviation from VWAP"""
+        if not self.price_history:
+            return 0.0
+            
+        current_price = self.get_mid_price()
+        vwap = self.calculate_vwap()
+        
+        if vwap == 0:
+            return 0.0
+            
+        return (current_price - vwap) / vwap
+        
+    def get_mid_price(self) -> float:
+        """Get current mid price"""
+        if not self.orderbook_history:
+            return 0.0
+            
+        latest_book = self.orderbook_history[-1]
+        best_bid = float(latest_book['bids'][0][0])
+        best_ask = float(latest_book['asks'][0][0])
+        return (best_bid + best_ask) / 2
 
     def calculate_volatility(self) -> float:
         """Calculate market volatility from price history"""
@@ -31,7 +77,7 @@ class MarketImpactCalculator:
             
         prices = pd.Series([p[1] for p in self.price_history])
         returns = np.log(prices / prices.shift(1)).dropna()
-        return returns.std() * np.sqrt(252)  # Annualized volatility
+        return returns.std() * np.sqrt(252)  #With this I will get Annualized volatility
 
     def calculate_market_depth(self) -> float:
         """Calculate market depth from current orderbook"""
@@ -54,6 +100,20 @@ class MarketImpactCalculator:
                 depth += float(ask_qty)
                 
         return depth
+
+    def get_current_spread(self) -> float:
+        """Calculate the current bid-ask spread from the latest orderbook data"""
+        if not self.orderbook_history:
+            return 0.001  # Default spread if no orderbook data
+            
+        latest_orderbook = self.orderbook_history[-1]
+        if not latest_orderbook.get('asks') or not latest_orderbook.get('bids'):
+            return 0.001
+            
+        best_ask = float(latest_orderbook['asks'][0][0])
+        best_bid = float(latest_orderbook['bids'][0][0])
+        
+        return (best_ask - best_bid) / best_bid  # Return relative spread
 
     def almgren_chriss_impact(self, quantity: float, timeframe: float = 1.0) -> float:
         """

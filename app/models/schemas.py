@@ -18,8 +18,9 @@ class SimulationParams(BaseModel):
     symbol: str = Field(description="Trading pair symbol")
     order_type: str = Field(default="market")
     quantity: float = Field(description="Order quantity in USD")
-    volatility: float = Field(description="Market volatility parameter")
-    fee_tier: str = Field(description="Exchange fee tier")
+    fee_tier: str = Field(description="Exchange fee tier", default="VIP0")
+    manual_volatility: Optional[float] = Field(None, description="Manual volatility override (if enabled)")
+    use_manual_volatility: bool = Field(default=False, description="Whether to use manual volatility")
 
 class SimulationResults(BaseModel):
     expected_slippage: float

@@ -10,6 +10,10 @@ from fastapi.staticfiles import StaticFiles
 
 from app.models.schemas import SimulationParams, SimulationResults, OrderBook
 from app.services.market_impact import MarketImpactCalculator
+from app.services.maker_taker_predictor import MakerTakerPredictor
+from app.services.slippage_predictor import SlippagePredictor
+from app.services.fee_calculator import FeeCalculator
+from app.services.performance_monitor import PerformanceMonitor
 from app.websocket.client import OrderBookWebSocket
 
 # Configure logging
@@ -33,12 +37,32 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 # Global state
 market_impact_calculators: Dict[str, MarketImpactCalculator] = {}
 websocket_clients: Dict[str, OrderBookWebSocket] = {}
+maker_taker_predictor = MakerTakerPredictor()
+slippage_predictor = SlippagePredictor()
+performance_monitor = PerformanceMonitor()
 
 async def orderbook_callback(data: dict):
     """Callback function for processing orderbook updates"""
-    symbol = data['symbol']
-    if symbol in market_impact_calculators:
-        market_impact_calculators[symbol].update_orderbook(data)
+    with performance_monitor.measure("data_processing"):
+        symbol = data['symbol']
+        if symbol in market_impact_calculators:
+            market_impact_calculators[symbol].update_orderbook(data)
+
+@app.get("/api/metrics")
+async def get_performance_metrics():
+    """Get performance metrics for all monitored components"""
+    return performance_monitor.get_all_metrics()
+
+@app.get("/api/fee-tiers")
+async def get_fee_tiers():
+    """Get available fee tiers and their rates"""
+    return {
+        tier: {
+            "rate": rate,
+            "percentage": f"{rate * 100:.3f}%"
+        }
+        for tier, rate in FeeCalculator.FEE_TIER_MAP.items()
+    }
 
 @app.on_event("startup")
 async def startup_event():
@@ -47,6 +71,9 @@ async def startup_event():
 @app.post("/api/simulate", response_model=SimulationResults)
 async def simulate_trade(params: SimulationParams):
     """Simulate a trade with given parameters"""
+    # Start measuring overall simulation loop
+    performance_monitor.start_measurement("simulation_loop")
+    
     symbol = params.symbol
     
     # Initialize calculator if not exists
@@ -66,20 +93,45 @@ async def simulate_trade(params: SimulationParams):
     
     calculator = market_impact_calculators[symbol]
     
+    # Get current market conditions
+    with performance_monitor.measure("data_processing"):
+        current_spread = calculator.get_current_spread()
+        current_depth = calculator.calculate_market_depth()
+        # Use manual volatility if enabled, otherwise use dynamic calculation
+        current_volatility = params.manual_volatility if params.use_manual_volatility else calculator.calculate_volatility()
+        vwap_deviation = calculator.get_vwap_deviation()
+    
     # Calculate market impact
-    start_time = datetime.utcnow()
-    market_impact = calculator.almgren_chriss_impact(params.quantity)
-    slippage = calculator.estimate_slippage(params.quantity)
+    with performance_monitor.measure("market_impact_calc"):
+        market_impact = calculator.almgren_chriss_impact(params.quantity)
     
-    # Calculate fees based on fee tier
-    fee_rate = 0.001  # Default fee rate, adjust based on fee tier
-    fees = params.quantity * fee_rate
+    # Predict slippage
+    with performance_monitor.measure("slippage_prediction"):
+        slippage = slippage_predictor.predict_slippage(
+            quantity=params.quantity,
+            volatility=current_volatility,
+            spread=current_spread,
+            depth=current_depth,
+            vwap_deviation=vwap_deviation,
+            timestamp=datetime.utcnow()
+        )
     
-    # Calculate maker/taker proportion (simplified)
-    maker_taker = 0.3  # Assuming 30% maker, 70% taker
+    # Calculate fees using the fee calculator
+    with performance_monitor.measure("fee_calculation"):
+        fees = FeeCalculator.calculate_fee(params.quantity, params.fee_tier)
     
-    # Calculate processing latency
-    latency = (datetime.utcnow() - start_time).total_seconds() * 1000  # in milliseconds
+    # Predict maker/taker proportion
+    maker_taker = maker_taker_predictor.predict_maker_probability(
+        size=params.quantity,
+        volatility=current_volatility,
+        spread=current_spread
+    )
+    
+    # End measuring simulation loop
+    performance_monitor.end_measurement("simulation_loop")
+    
+    # Log metrics periodically
+    performance_monitor.log_metrics()
     
     return SimulationResults(
         expected_slippage=slippage,
@@ -87,7 +139,7 @@ async def simulate_trade(params: SimulationParams):
         market_impact=market_impact,
         net_cost=slippage + fees + market_impact,
         maker_taker_proportion=maker_taker,
-        internal_latency=latency,
+        internal_latency=performance_monitor.get_metrics("simulation_loop").avg_latency,
         timestamp=datetime.utcnow()
     )
 
@@ -97,11 +149,13 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     try:
         while True:
-            # Send updates every second
-            for symbol, calculator in market_impact_calculators.items():
-                if calculator.orderbook_history:
-                    latest_data = calculator.orderbook_history[-1]
-                    await websocket.send_json(latest_data)
+            # Measure UI update latency
+            with performance_monitor.measure("ui_update"):
+                # Send updates every second
+                for symbol, calculator in market_impact_calculators.items():
+                    if calculator.orderbook_history:
+                        latest_data = calculator.orderbook_history[-1]
+                        await websocket.send_json(latest_data)
             await asyncio.sleep(1)
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
